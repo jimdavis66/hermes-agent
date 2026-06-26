@@ -1,0 +1,94 @@
+# Weekly image build using the official Hermes Agent image tag `latest`
+# as the Dockerfile HERMES_BASE (always whatever upstream currently points to).
+
+name: Docker weekly
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # Mondays 06:15 UTC
+    - cron: "15 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-hermes-weekly
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  HERMES_IMAGE: nousresearch/hermes-agent
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Avoid publishing `latest` from feature branches (schedule already uses default).
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image name (GHCR must be lowercase)
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY@L}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve upstream `latest` digest and release version
+        id: upstream
+        run: |
+          set -euo pipefail
+          DIGEST="$(docker buildx imagetools inspect "${HERMES_IMAGE}:latest" --format '{{.Manifest.Digest}}')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          PINNED="${HERMES_IMAGE}:latest@${DIGEST}"
+          echo "HERMES_BASE=${PINNED}" >> "$GITHUB_ENV"
+
+          JSON="$(docker buildx imagetools inspect "${PINNED}" --format '{{json (index .Image "linux/amd64")}}')"
+          REV="$(printf '%s\n' "$JSON" | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')"
+          if [ -z "$REV" ] || [ "$REV" = "null" ]; then
+            echo 'Could not read org.opencontainers.image.revision from upstream Hermes image.' >&2
+            exit 1
+          fi
+          SHORT="${REV:0:12}"
+          echo "hermes_revision=${REV}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=upstream-${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.upstream.outputs.version_tag }}
+            type=schedule,pattern=weekly-{{date 'YYYYMMDD'}}
+            type=sha,prefix=,format=short
+          labels: |
+            org.opencontainers.image.base.name=${{ env.HERMES_IMAGE }}:latest
+            org.opencontainers.image.base.digest=${{ steps.upstream.outputs.digest }}
+            dev.hermes.upstream-revision=${{ steps.upstream.outputs.hermes_revision }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          build-args: |
+            HERMES_BASE=${{ env.HERMES_BASE }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
